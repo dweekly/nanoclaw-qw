@@ -1,12 +1,13 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 
 import { isSafeAttachmentName, routeAgentMessage } from './agent-route.js';
 import { createDestination } from './db/agent-destinations.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
-import { createSession } from '../../db/sessions.js';
-import { initSessionFolder, inboundDbPath } from '../../session-manager.js';
+import { createSession, updateSession } from '../../db/sessions.js';
+import { initSessionFolder, inboundDbPath, sessionDir, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 
 vi.mock('../../container-runner.js', () => ({
@@ -272,5 +273,164 @@ describe('routeAgentMessage return-path', () => {
     expect(s1Rows).toHaveLength(1);
     expect(JSON.parse(s1Rows[0].content).text).toBe('standing by');
     expect(s2Rows).toHaveLength(0);
+  });
+
+  it('stale origin fallback: archived origin session falls through to newest active', async () => {
+    // A.S1 sends to B, establishing source_session_id = S1.id on B's inbound.
+    await routeAgentMessage(
+      { id: 'msg-fwd', platform_id: B, content: JSON.stringify({ text: 'hello' }), in_reply_to: null },
+      S1,
+    );
+    const bRows = readInbound(B, SB.id);
+    const inboundId = bRows[0].id;
+
+    // Archive S1 — simulates session cleanup or channel disconnect.
+    updateSession(S1.id, { status: 'archived' });
+
+    // B replies. origin points to S1 (archived), should fall through to S2.
+    await routeAgentMessage(
+      { id: 'msg-reply-stale', platform_id: A, content: JSON.stringify({ text: 'reply' }), in_reply_to: inboundId },
+      SB,
+    );
+
+    const s1Rows = readInbound(A, S1.id);
+    const s2Rows = readInbound(A, S2.id);
+    expect(s1Rows).toHaveLength(0);
+    expect(s2Rows).toHaveLength(1);
+  });
+
+  it('cross-agent-group guard: origin session belonging to wrong agent group is rejected', async () => {
+    // Third agent group C sends to B, stamping source_session_id = SC on B's inbound.
+    const C = 'ag-C';
+    createAgentGroup({ id: C, name: 'C', folder: 'c', agent_provider: null, created_at: now() });
+    const SC: Session = {
+      id: 'sess-C',
+      agent_group_id: C,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-03-01T00:00:00.000Z',
+    };
+    createSession(SC);
+    initSessionFolder(C, SC.id);
+    createDestination({ agent_group_id: C, local_name: 'b', target_type: 'agent', target_id: B, created_at: now() });
+
+    await routeAgentMessage(
+      { id: 'msg-from-C', platform_id: B, content: JSON.stringify({ text: 'from C' }), in_reply_to: null },
+      SC,
+    );
+    const bRows = readInbound(B, SB.id);
+    const cInboundId = bRows.find((r) => r.platform_id === C)!.id;
+
+    // B replies to A, but in_reply_to references the C-originated row.
+    // Guard rejects (SC belongs to C, not A) → falls through to newest of A.
+    await routeAgentMessage(
+      { id: 'msg-reply-tamper', platform_id: A, content: JSON.stringify({ text: 'misdirected' }), in_reply_to: cInboundId },
+      SB,
+    );
+
+    const s1Rows = readInbound(A, S1.id);
+    const s2Rows = readInbound(A, S2.id);
+    expect(s1Rows).toHaveLength(0);
+    expect(s2Rows).toHaveLength(1);
+  });
+
+  it('in_reply_to referencing a non-a2a row falls through to newest session', async () => {
+    // Write a channel message into B's inbound (no source_session_id).
+    writeSessionMessage(B, SB.id, {
+      id: 'channel-msg-1',
+      kind: 'chat',
+      timestamp: now(),
+      platformId: 'user-123',
+      channelType: 'slack',
+      threadId: null,
+      content: 'hello from slack',
+    });
+
+    // B replies to A with in_reply_to pointing to the channel message.
+    // source_session_id is null → peer-affinity finds nothing → newest of A.
+    await routeAgentMessage(
+      { id: 'msg-reply-channel', platform_id: A, content: JSON.stringify({ text: 'response' }), in_reply_to: 'channel-msg-1' },
+      SB,
+    );
+
+    const s1Rows = readInbound(A, S1.id);
+    const s2Rows = readInbound(A, S2.id);
+    expect(s1Rows).toHaveLength(0);
+    expect(s2Rows).toHaveLength(1);
+  });
+
+  it('self-message is allowed without a destination row', async () => {
+    // A targets itself — no agent_destinations row exists for A→A.
+    await routeAgentMessage(
+      { id: 'self-msg', platform_id: A, content: JSON.stringify({ text: 'self-note' }), in_reply_to: null },
+      S1,
+    );
+
+    // Lands in S2 (newest active session of A via resolveSession fallback).
+    const s2Rows = readInbound(A, S2.id);
+    expect(s2Rows).toHaveLength(1);
+    expect(JSON.parse(s2Rows[0].content).text).toBe('self-note');
+  });
+
+  it('BUG: no volume cap on a2a routing — unbounded ping-pong is allowed (#2063)', async () => {
+    // Two agents can exchange unlimited messages with no rate limit or loop
+    // detection. This test documents the gap — it should FAIL once #2063 lands.
+    const errors: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      try {
+        await routeAgentMessage(
+          { id: `ping-${i}`, platform_id: B, content: JSON.stringify({ text: `ping ${i}` }), in_reply_to: null },
+          S1,
+        );
+        await routeAgentMessage(
+          { id: `pong-${i}`, platform_id: A, content: JSON.stringify({ text: `pong ${i}` }), in_reply_to: null },
+          SB,
+        );
+      } catch (e) {
+        errors.push((e as Error).message);
+        break;
+      }
+    }
+    // BUG: all 40 messages go through — no cap, no throttle.
+    // Once loop prevention lands, this should throw or reject after a threshold.
+    const bRows = readInbound(B, SB.id);
+    const s1Rows = readInbound(A, S1.id);
+    const s2Rows = readInbound(A, S2.id);
+    expect(errors).toHaveLength(0);
+    expect(bRows).toHaveLength(20);
+    expect(s1Rows.length + s2Rows.length).toBe(20);
+  });
+
+  it('file forwarding: copies bytes from source outbox to target inbox', async () => {
+    // Place a file in S1's outbox for the message.
+    const outboxDir = path.join(sessionDir(A, S1.id), 'outbox', 'msg-with-file');
+    fs.mkdirSync(outboxDir, { recursive: true });
+    fs.writeFileSync(path.join(outboxDir, 'report.pdf'), 'fake-pdf-bytes');
+
+    await routeAgentMessage(
+      {
+        id: 'msg-with-file',
+        platform_id: B,
+        content: JSON.stringify({ text: 'see attached', files: ['report.pdf'] }),
+        in_reply_to: null,
+      },
+      S1,
+    );
+
+    const bRows = readInbound(B, SB.id);
+    expect(bRows).toHaveLength(1);
+    const parsed = JSON.parse(bRows[0].content);
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.attachments[0].name).toBe('report.pdf');
+    expect(parsed.attachments[0].type).toBe('file');
+
+    // Verify actual file bytes were copied to the target inbox.
+    const targetPath = path.join(sessionDir(B, SB.id), parsed.attachments[0].localPath);
+    expect(fs.existsSync(targetPath)).toBe(true);
+    expect(fs.readFileSync(targetPath, 'utf-8')).toBe('fake-pdf-bytes');
   });
 });
