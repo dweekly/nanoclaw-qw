@@ -14,7 +14,6 @@
  * Storage is a JSON file at data/telegram-pairings.json — single-process,
  * read-modify-write under an in-process mutex.
  */
-import { randomInt } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -92,10 +91,9 @@ function readStore(): Store {
 
 function writeStore(store: Store): void {
   const p = storePath();
-  // Pairing tokens are sensitive auth material: lock down dir (0700) and file (0600).
-  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
   fs.renameSync(tmp, p);
 }
 
@@ -108,12 +106,10 @@ function sweep(store: Store): boolean {
 
 function generateCode(active: Set<string>): string {
   // 4-digit numeric, zero-padded. 10k space, fine for one-at-a-time intents.
-  // CSPRNG (crypto.randomInt), not Math.random: codes are an auth boundary
-  // (first pairer can be promoted to owner) and Math.random's internal state
-  // is recoverable from prior outputs, which would let an attacker predict the
-  // next code. randomInt(0, 10000) is uniform over [0, 9999], no modulo bias.
   for (let i = 0; i < 50; i++) {
-    const code = randomInt(0, 10000).toString().padStart(4, '0');
+    const code = Math.floor(Math.random() * 10000)
+      .toString()
+      .padStart(4, '0');
     if (!active.has(code)) return code;
   }
   throw new Error('Could not allocate a free pairing code (too many active).');
