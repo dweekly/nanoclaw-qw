@@ -92,9 +92,11 @@ function readStore(): Store {
 
 function writeStore(store: Store): void {
   const p = storePath();
-  // Pairing tokens are sensitive auth material: lock down dir (0700) and file (0600).
+  // Codes are auth material: dir 0700, file 0600. Modes only apply at
+  // creation, so drop any stale tmp that would carry old perms through rename.
   fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
   const tmp = `${p}.tmp`;
+  fs.rmSync(tmp, { force: true });
   fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, p);
 }
@@ -108,10 +110,8 @@ function sweep(store: Store): boolean {
 
 function generateCode(active: Set<string>): string {
   // 4-digit numeric, zero-padded. 10k space, fine for one-at-a-time intents.
-  // CSPRNG (crypto.randomInt), not Math.random: codes are an auth boundary
-  // (first pairer can be promoted to owner) and Math.random's internal state
-  // is recoverable from prior outputs, which would let an attacker predict the
-  // next code. randomInt(0, 10000) is uniform over [0, 9999], no modulo bias.
+  // randomInt, not Math.random: the first pairer can be promoted to owner,
+  // and Math.random is predictable from its prior outputs.
   for (let i = 0; i < 50; i++) {
     const code = randomInt(0, 10000).toString().padStart(4, '0');
     if (!active.has(code)) return code;
@@ -321,7 +321,7 @@ export async function waitForPairing(code: string, opts: WaitForPairingOptions =
 
     try {
       const dir = path.dirname(storePath());
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       watcher = fs.watch(dir, (_event, fname) => {
         if (!fname || fname.toString().startsWith(path.basename(storePath()))) check();
       });
