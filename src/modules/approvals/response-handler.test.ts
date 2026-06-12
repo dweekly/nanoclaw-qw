@@ -1,19 +1,24 @@
 /**
- * Tests for the authorization gate in handleApprovalsResponse.
+ * Tests for the authorization gates in handleApprovalsResponse.
  *
- * The webhook receiver can't fully authenticate clicks (it only verifies
- * platform signatures), so the response handler must re-check that the
- * clicker is actually an eligible approver for the agent group before
- * dispatching the registered approval handler. Without this check, anyone
- * who can post a forged response to the webhook can attribute their
- * "approve" to any user id they choose.
+ * The webhook receiver only verifies platform signatures, so a forged
+ * response can carry any userId. Two layers of defense apply before a
+ * registered approval handler is dispatched:
+ *   - isAuthorizedApprovalClick rejects clicks from users without admin
+ *     privilege on the approval's agent group (owner / global-admin when the
+ *     approval is not bound to a specific group).
+ *   - isAuthorizedClicker re-checks that the namespaced clicker id is in the
+ *     eligible-approver list (pickApprover) for the agent group.
+ *
+ * Without these checks, anyone who can post a forged response to the webhook
+ * could attribute their "approve" to any user id they choose.
  */
 import fs from 'fs';
 
-import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { createPendingApproval, createSession } from '../../db/sessions.js';
+import { createPendingApproval, createSession, getPendingApproval } from '../../db/sessions.js';
 import { createUser } from '../permissions/db/users.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 
@@ -41,8 +46,8 @@ const APPROVAL_OPTIONS = JSON.stringify([
   { label: 'Reject', value: 'reject' },
 ]);
 
-beforeEach(async () => {
-  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+beforeEach(() => {
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   const db = initTestDb();
   runMigrations(db);
@@ -89,13 +94,13 @@ beforeEach(async () => {
 
 afterEach(() => {
   closeDb();
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
 describe('handleApprovalsResponse — clicker authorization', () => {
   it('authorized owner click invokes the registered handler and deletes the row', async () => {
     const { registerApprovalHandler } = await import('./primitive.js');
     const { handleApprovalsResponse } = await import('./response-handler.js');
-    const { getPendingApproval } = await import('../../db/sessions.js');
 
     let handlerCalled = false;
     let receivedUserId: string | undefined;
@@ -123,7 +128,6 @@ describe('handleApprovalsResponse — clicker authorization', () => {
   it('unauthorized clicker is rejected: handler is NOT invoked and the row stays intact', async () => {
     const { registerApprovalHandler } = await import('./primitive.js');
     const { handleApprovalsResponse } = await import('./response-handler.js');
-    const { getPendingApproval } = await import('../../db/sessions.js');
 
     let handlerCalled = false;
     registerApprovalHandler('test_action', async () => {
@@ -189,5 +193,50 @@ describe('handleApprovalsResponse — clicker authorization', () => {
     });
 
     expect(handlerCalled).toBe(false);
+  });
+
+  it('allows a global admin to resolve an approval not bound to a specific agent group', async () => {
+    createUser({
+      id: 'telegram:global-admin',
+      kind: 'telegram',
+      display_name: 'Global Admin',
+      created_at: now(),
+    });
+    grantRole({
+      user_id: 'telegram:global-admin',
+      role: 'admin',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+
+    const { registerApprovalHandler } = await import('./primitive.js');
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    const handler = vi.fn().mockResolvedValue(undefined);
+    registerApprovalHandler('global_admin_allowed', handler);
+
+    createPendingApproval({
+      approval_id: 'appr-3',
+      session_id: 'sess-1',
+      request_id: 'appr-3',
+      action: 'global_admin_allowed',
+      payload: JSON.stringify({ packages: ['left-pad'] }),
+      created_at: now(),
+      title: 'Install packages',
+      options_json: APPROVAL_OPTIONS,
+    });
+
+    const claimed = await handleApprovalsResponse({
+      questionId: 'appr-3',
+      value: 'approve',
+      userId: 'global-admin',
+      channelType: 'telegram',
+      platformId: 'telegram:global-admin',
+      threadId: null,
+    });
+
+    expect(claimed).toBe(true);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(getPendingApproval('appr-3')).toBeUndefined();
   });
 });
